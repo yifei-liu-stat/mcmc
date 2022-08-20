@@ -1,0 +1,415 @@
+---
+title: "Stat 8054 Doing Assignment 4"
+author: "Yifei Liu"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document: default
+#   pdf_document: default
+#     number_sections: true
+---
+
+# R
+* The version of R used to make this document is 4.0.3
+* The version of the `rmarkdown` package used to make this document is 2.7.
+* The version of the `mcmc` package used here is 0.9-7.
+```{r warning=FALSE}
+library(mcmc)
+```
+
+
+# Data
+The data used here are the results for for the 2019–2020 season for the highest professional league for American football.
+```{r}
+load(url("http://www.stat.umn.edu/geyer/8054/data/nfl2019.rda"))
+```
+
+Here are some essential information of this game. There are 267 games in total, out of which:
+256 of them are regular-season games, 11 of them are playoffs;
+one game had tie in the end;
+6 games were held in netral sites;
+Also, there were 32 teams involved for this dataset.
+
+```{r}
+dim(nfl2019) # 267 games in total
+with(nfl2019, sum(week <= 17)) # 256 regular-season game and 11 post-season game
+with(nfl2019, sum(road.score == home.score)) # 1 game that has a tie
+with(nfl2019, sum(neutral == 1)) # 6 games on neutral sites
+with(nfl2019, length(unique(union(home.team, road.team)))) # 32 teams in total
+```
+
+According to the [homework description](https://www.stat.umn.edu/geyer/8054/hw/nfl.html) by Prof. Geyer,
+we first renumber involved teams with number starting from 3;
+Then we create response vector `homewin`, `roadwin` or `tie`;
+We also create `regular` to indicate whether a game was in regular session or post session;
+*neutral* is created to imply whether a game was played in a neutral site or not.
+
+```{r}
+# Preprocess data
+mydata <- nfl2019
+# enumerate teams. can convert directly since levels and their orders are same
+mydata$home.team <- 2 + as.numeric(as.factor(mydata$home.team))
+mydata$road.team <- 2 + as.numeric(as.factor(mydata$road.team))
+# regular session or not
+mydata$regular <- with(mydata, as.numeric(week <= 17))
+# response vector. (homewin, roadwin, tie)
+mydata$homewin <- with(mydata, as.numeric(home.score > road.score))
+mydata$roadwin <- with(mydata, as.numeric(home.score < road.score))
+mydata$tie <- with(mydata, as.numeric(home.score == road.score))
+# remove extra information: week, seed, conf
+rmindex <- which(colnames(mydata) %in% c("week", "road.seed", "home.seed",
+                         "conf", "home.score", "road.score"))
+mydata <- mydata[, -rmindex]
+# switch postions of two team columns
+mydata <- cbind(home.team = mydata$home.team, road.team = mydata$road.team,
+                        mydata[, 3:7])
+```
+
+Check the processed dataset,
+```{r}
+head(mydata)
+```
+
+and some other quantities that can describe the dataset.
+In particular, we need 34 latent parameters to describe our model.
+```{r}
+# names for beta, 34 = 32 + 2 in total
+varname <- c("ties", "homeadvatange", levels(as.factor(nfl2019$home.team)))
+K <- length(varname)
+N <- dim(nfl2019)[1]
+varname
+```
+
+# Model
+The details of the model we will use is discussed clearly in [homework description, Section 4](https://www.stat.umn.edu/geyer/8054/hw/nfl.html),
+here we just summarize the key information.
+We would like to use multinomial distribution for modelling, to be specific, each game is related to a canonical parameter $\boldsymbol \theta = (\theta_1, \theta_2, \theta_3)^{\mathsf T}$,
+indicating the result of this game (homewin, roadwin or tie).
+The parameter $\boldsymbol \pi = (\pi_1, \pi_2, \pi_3)^{\mathsf T}$ (probabilities) for the multinomial distribution can be deriven from $\boldsymbol \theta$, with
+$$\pi_k = \frac{e^{\theta_k}}{\sum_{i=1}^3 e^{\theta_i}}\text{ for }k = 1, 2, 3$$
+
+Also, for each game, we model $\boldsymbol \theta$ linearly as $\boldsymbol m \boldsymbol \beta$,
+where $\boldsymbol m \in \mathbb R^{3 \times 34}$ is the model matrix for this specific game,
+and $\boldsymbol \beta \in \mathbb R^{34}$ is the aforementioned 34 latent paramters.
+The construction of $\boldsymbol m$ is exactly the same as [homework description, Section 4](https://www.stat.umn.edu/geyer/8054/hw/nfl.html),
+but we address what this construction implies for the relationship between $\boldsymbol \theta$ and $\boldsymbol \beta$.
+
+If a regular-session game (`regular == 1`) was played by a home team $k_1$ versus a road team $k_2$ ($k_1 \neq k_2$), then we have,
+\begin{align*}
+&\theta_1 = \beta_2\times I(neutral = 0) + \beta_{k_1}\\
+&\theta_2 = \beta_{k_2}\\
+&\theta_3 = \beta_1 + \frac{1}{2} \beta_2\times I(neutral = 0) + \frac{1}{2} \beta_{k_1} + \frac{1}{2} \beta_{k_2}
+\end{align*}
+
+and for a post-session game (`regular == 0`), everything is the same except that $\theta_3 = -\inf$,
+implying 0 probability for tie as a result.
+For model matrix $\boldsymbol m$ in this case, we simply use `NA` temporarily, and deal with them when needed.
+
+Next we create a function `modeltensor` which can convert our game information in `mydata` to a model tensor $\boldsymbol M \in \mathbb R^{267\times 3\times 34}$,
+with $\boldsymbol M[i, , ]$ the model matrix for game $i$.
+Note that we use `array()` in R to implement $\boldsymbol M$, so the $i$-th model matrix is actually called by `M[, , i]` instead.
+
+```{r}
+modeltensor <- function(gameinfo) {
+    N <- dim(gameinfo)[1]
+    M <- array(0, c(3, K, N))
+
+    for (n in 1:N) {
+        home.team <- gameinfo[n, 1]
+        road.team <- gameinfo[n, 2]
+        neutral <- gameinfo[n, 3]
+        regular <- gameinfo[n, 4]
+
+        result <- M[, , n]
+        # effect of tie
+        result[3, 1] <- 1
+        # effect of home advantage
+        if (neutral == 0)
+            result[c(1, 3), 2] <- c(1, 1 / 2)
+        # effect teams
+        result[c(1, 3), home.team] <- c(1, 1 / 2)
+        result[c(2, 3), road.team] <- c(1, 1 / 2)
+        # correction of post-session game (I think use -Inf should be better)
+        if (regular == 0)
+            result[3, ] <- NA # use 0 for canonical stat and -Inf for \theta
+
+        M[, , n] <- result
+    }
+    return(M)
+}
+```
+
+Here `gameinfo` should be of class `data.frame`, with the first 4 clumns as `home.team`, `road.team`, `neutral` and `regular`.
+For example, here is the model matrix $\boldsymbol m$ for the first game in the regular session,
+```{r}
+s <- modeltensor(mydata[1, ])
+colnames(s) <- varname
+s
+```
+
+## Log of unnormalized density
+In order to implement MCMC, we need to evaluate log likelihood.
+The log likelihood of the multinomial model based on the whole dataset is,
+$$\ell(\boldsymbol \Theta) = \langle \boldsymbol Y, \boldsymbol \Theta \rangle - \sum_{\boldsymbol \theta \in \boldsymbol \Theta} c(\boldsymbol \theta)$$
+where $\boldsymbol Y\in \mathbb R^{267\times 3}$ is the response matrix;
+$\boldsymbol \Theta \in \mathbb R^{267 \times 3}$ contains $\boldsymbol \theta = (\theta_1, \theta_2, \theta_3)^{\mathsf T}$'s (as rows) for all games, and 
+$$c(\boldsymbol \theta) = \log (\sum_{i=1}^3 e^{\theta_i})$$
+is the cumulant function as in [5421 Lecture Notes on Exponential Families, Section 2.4.3, Try III](https://www.stat.umn.edu/geyer/5421/notes/expfam.pdf#page=12).
+```{r}
+log.unnormalized.density <- function(beta) {
+    stopifnot(is.numeric(beta))
+    stopifnot(is.finite(beta))
+
+    # canonical statistics
+    canostat <- NULL
+    for (k in 1:K) {
+        temp <- sum(diag(M_0[, k, ] %*% as.matrix(mydata[, 5:7])))
+        canostat <- c(canostat, temp)
+    }
+
+    # cumulant part
+    cumulant <- 0
+    for (n in 1:N) {
+        theta_i <- M[, , n] %*% beta
+
+        # deal with non-regular session
+        if (mydata[n, "regular"] == 0)
+           theta_i[3, 1] <- -Inf # always -Inf so 0 prob for tie in post-session
+
+        cumulant_i <- log(sum(exp(theta_i)))
+        cumulant <- cumulant + cumulant_i
+    }
+
+    # combine them together
+    sum(canostat * beta) - cumulant
+}
+```
+
+For the priors, we use the same priors (for all elements in $\boldsymbol \beta$) as in [Stat 3701 Lecture Notes: Bayesian Inference via Markov Chain Monte Carlo (MCMC), Section 9.3.2](https://www.stat.umn.edu/geyer/3701/notes/mcmc-bayes.html#log-prior-and-posterior)
+```{r}
+# unnormalized log prior
+log.unnormalized.prior <- function(beta) {
+    stopifnot(is.numeric(beta))
+    stopifnot(is.finite(beta))
+
+    logp <- ifelse(beta < 0, beta - log1p(exp(beta)), - log1p(exp(- beta)))
+    logq <- ifelse(beta < 0, - log1p(exp(beta)), - beta - log1p(exp(- beta)))
+    sum(logp) + sum(logq)
+}
+# unnormalized log posterior
+log.unnormalized.posterior <- function(beta)
+    log.unnormalized.density(beta) + log.unnormalized.prior(beta)
+```
+
+# Simulation
+Everything is ready and it's time for simulation.
+We use `metrop()` function in R package `mcmc` for implementation.
+```{r eval=FALSE}
+set.seed(1234) # for reproducibility
+mout <- metrop(log.unnormalized.posterior, rep(0, K),
+    nbatch = 150, blen = 150, scale = 0.21)
+mout$accept
+
+mout <- metrop(mout, scale = 0.215)
+mout$accept
+
+mout <- metrop(mout, scale = 0.22)
+mout$accept
+t.test(mout$accept.batch)$conf.int
+
+save(mout, file = "mout.RData")
+```
+
+The run took a long time (minutes) in my PC, so for convenience (compiling of `.Rmd` by `rmarkdown::render`), I saved the chain `mout` in a file `mout.RData`,
+and load it when used (all `.RData` files can be found under the same directory as `8054hw.Rmd` file).
+```{r}
+load(file = "mout.Rdata")
+```
+```{r}
+mout$accept
+t.test(mout$accept.batch)$conf.int
+```
+
+Looks good. Here are some plots for the chain.
+```{r}
+plot(ts(mout$batch[, 1]), main = "Batch Means for Tie Coefficient")
+plot(ts(mout$batch[, 2]), main = "Batch Means for Home Advantage Coefficient")
+acf(ts(mout$batch[, 2]),
+        main = "Autocorrelation of Tie Coefficient")
+acf(ts(mout$batch[, 2]),
+        main = "Autocorrelation of Home Advantage Coefficient")
+plot(ts(mout$batch[, 2]), main = "Batch Means for 49ers Coefficient")
+acf(ts(mout$batch[, 2]),
+        main = "Autocorrelation of 49ers Coefficient")
+```
+
+The chains are good. Next we answer two specific questions raised in [homework description, Section 4](https://www.stat.umn.edu/geyer/8054/hw/nfl.html).
+
+## Specific question 1
+This one is pretty easy, we just need to convert $\boldsymbol \beta$ to $\boldsymbol \theta$ for this specific game,
+```{r}
+mydata[267, ]
+```
+
+```{r}
+n <- 267 # game index
+outfun <- function(beta) {
+    theta_i <- M[, , n] %*% beta
+    # deal with non-regular session
+    if (mydata[n, "regular"] == 0)
+        theta_i[3, 1] <- -Inf # always -Inf so 0 prob for tie in post-session
+
+    exp(theta_i) / sum(exp(theta_i))
+}
+```
+
+Similarly, we have saved the result and just to load it to the workspace to save the compiling time.
+```{r eval=FALSE}
+mout_1 <- metrop(mout, blen = 1000, outfun = outfun)
+save(mout_1, file = "mout_Q1.RData")
+```
+```{r}
+load(file = "mout_Q1.RData")
+prob <- colMeans(mout_1$batch)
+names(prob) <- c("homewin", "roadwin", "tie")
+prob
+```
+```{r}
+nfl2019[267, 1:4]
+```
+
+The simulation shows that if we replayed the game, 49ers is more likely (0.5369) to win as a road team.
+
+To check the chain with some plots, they look good.
+```{r}
+foo <- as.ts(mout_1$batch[, 1:2])
+```
+```{r}
+plot(foo)
+acf(foo)
+```
+
+## Specific question 2
+This one is quite compliated, but one can simulate the final winner according to the described rules.
+We first prepare a dataset that contains all necessary information (`teamname`, `teamindex`, `seed`, `conf`) for all teams invovled in playoffs.
+```{r}
+# related teams and their index
+finalteams <- with(nfl2019[257:267, ], unique(union(home.team, road.team))) # 12
+teamindex <- which(varname %in% finalteams)
+teamname <- varname[teamindex]
+
+teamseed <- rep(0, 12)
+teamconf <- rep("AFC", 12)
+temp <- nfl2019[257:266, ] # no need for the last game with two diff confs
+for (i in 1:dim(temp)[1]) {
+    index <- which(teamname == temp$road.team[i])
+    teamseed[index] <- temp$road.seed[i]
+    teamconf[index] <- temp$conf[i]
+
+    index <- which(teamname == temp$home.team[i])
+    teamseed[index] <- temp$home.seed[i]
+    teamconf[index] <- temp$conf[i]
+}
+# aggregate information of teams in the playoffs
+finalgames <- data.frame(teamname, teamindex, teamseed, teamconf)
+head(finalgames)
+```
+
+Then we need an output function that can take $\boldsymbol \beta$ as input, and output a final winner based on the complicated matching rule.
+The function below `outfun2` could have been designed cleverly, but I just implement it with ``brute force''.
+That should be okay as long as I can have the right mapping relationship.
+```{r}
+outfun2 <- function(beta) {
+    # within AFC
+    ## result of week 18
+    w18_AFC1 <- ifelse(beta[2] + beta[32] > beta[6], 32, 6)
+    w18_AFC2 <- ifelse(beta[2] + beta[24] > beta[33], 24, 33)
+    ### record seed information
+    seed1 <- with(finalgames, teamseed[teamindex == w18_AFC1])
+    seed2 <- with(finalgames, teamseed[teamindex == w18_AFC2])
+    ## result of week 19
+    if (seed1 < seed2) {
+        w19_AFC1 <- ifelse(beta[2] + beta[27] > beta[w18_AFC1], 27, w18_AFC1)
+        w19_AFC2 <- ifelse(beta[2] + beta[12] > beta[w18_AFC2], 12, w18_AFC2)
+    }
+    if (seed1 > seed2) {
+        w19_AFC1 <- ifelse(beta[2] + beta[27] > beta[w18_AFC2], 27, w18_AFC2)
+        w19_AFC2 <- ifelse(beta[2] + beta[12] > beta[w18_AFC1], 12, w18_AFC1)
+    }
+    ### record seed information
+    seed1 <- with(finalgames, teamseed[teamindex == w19_AFC1])
+    seed2 <- with(finalgames, teamseed[teamindex == w19_AFC2])
+    ## result of week 20
+    if (seed1 < seed2)
+        w20_AFC <- ifelse(beta[2] + beta[w19_AFC1] > beta[w19_AFC2],
+                          w19_AFC1, w19_AFC2)
+    if (seed1 > seed2)
+        w20_AFC <- ifelse(beta[2] + beta[w19_AFC2] > beta[w19_AFC1],
+                          w19_AFC2, w19_AFC1)
+
+    # within NFC
+    ## result of week 18
+    w18_NFC1 <- ifelse(beta[2] + beta[29] > beta[34], 29, 34)
+    w18_NFC2 <- ifelse(beta[2] + beta[16] > beta[30], 16, 30)
+    ### record seed information
+    seed1 <- with(finalgames, teamseed[teamindex == w18_NFC1])
+    seed2 <- with(finalgames, teamseed[teamindex == w18_NFC2])
+    ## result of week 19
+    if (seed1 < seed2) {
+        w19_NFC1 <- ifelse(beta[2] + beta[3] > beta[w18_NFC1], 3, w18_NFC1)
+        w19_NFC2 <- ifelse(beta[2] + beta[22] > beta[w18_NFC2], 22, w18_NFC2)
+    }
+    if (seed1 > seed2) {
+        w19_NFC1 <- ifelse(beta[2] + beta[3] > beta[w18_NFC2], 3, w18_NFC2)
+        w19_NFC2 <- ifelse(beta[2] + beta[22] > beta[w18_NFC1], 22, w18_NFC1)
+    }
+    ### record seed information
+    seed1 <- with(finalgames, teamseed[teamindex == w19_NFC1])
+    seed2 <- with(finalgames, teamseed[teamindex == w19_NFC2])
+    ## result of week 20
+    if (seed1 < seed2)
+        w20_NFC <- ifelse(beta[2] + beta[w19_NFC1] > beta[w19_NFC2],
+                          w19_NFC1, w19_NFC2)
+    if (seed1 > seed2)
+        w20_NFC <- ifelse(beta[2] + beta[w19_NFC2] > beta[w19_NFC1],
+                          w19_NFC2, w19_NFC1)
+
+    # final game between AFC and NFC! week 21!
+    w21 <- ifelse(beta[w20_AFC] > beta[w20_NFC], w20_AFC, w20_NFC)
+
+    result <- rep(0, dim(finalgames)[1])
+    index <- with(finalgames, which(teamindex == w21))
+    result[index] <- 1
+    names(result) <- finalgames$teamname
+    result
+}
+```
+
+As usual, I ran a chain with `outfun2`, save it, and load it when needed to save compiling time.
+```{r eval=FALSE}
+mout_2 <- metrop(mout, blen = 1000, outfun = outfun2)
+save(mout_2, file = "mout_Q2.RData")
+```
+```{r}
+load(file = "mout_Q2.RData")
+winprob <- colMeans(mout_2$batch)
+names(winprob) <- finalgames$teamname
+winprob
+```
+
+As we can see, according to the simulation, 49ers is mostly likely to be the champion,
+followed by Ravens, Chiefs and Packers.
+We can take the significant result (say, $>0.1$), and get MCSE, 
+```{r}
+# take results that are significant
+foo <- as.ts(mout_2$batch)
+colnames(foo) <- finalgames$teamname
+foo <- foo[, colMeans(foo) > 0.1]
+mcse <- apply(foo, 2, sd) / sqrt(mout$nbatch)
+rbind(batchest = colMeans(foo), mcse)
+```
+
+and we can check these chains with plots, 
+```{r}
+plot(foo)
+acf(foo)
+```
